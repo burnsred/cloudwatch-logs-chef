@@ -1,4 +1,6 @@
 define :cloudwatch_log_stream do
+    params[:log_stream_name] ||= node['cloudwatch-logs']['log_stream_name']
+
     service 'awslogs' do
         action :nothing
     end
