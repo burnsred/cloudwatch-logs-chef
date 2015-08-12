@@ -5,6 +5,7 @@ define :cloudwatch_log_stream do
 
     template "/var/awslogs/etc/conf.d/#{params[:name]}.conf" do
         source 'log-stream.conf.erb'
+        cookbook 'cloudwatch-logs'
 
         variables(
             :name => params[:name],
