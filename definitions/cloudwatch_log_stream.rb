@@ -5,7 +5,7 @@ define :cloudwatch_log_stream do
         action :nothing
     end
 
-    template "/var/awslogs/etc/conf.d/#{params[:name]}.conf" do
+    template "/var/awslogs/etc/config/#{params[:name]}.conf" do
         source 'log-stream.conf.erb'
         cookbook 'cloudwatch-logs'
 

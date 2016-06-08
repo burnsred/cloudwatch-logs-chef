@@ -10,10 +10,8 @@
 # language governing permissions and limitations under the License.
 #
 #
-# Script Version: 1.3.6-burnsred
+# Script Version: 1.3.9
 #
-# Modified to have a conf.d style system
-
 
 from optparse import OptionParser
 import os
@@ -35,12 +33,8 @@ except ImportError:
 LAUNCHER_SCRIPT = """#!/bin/sh
 # Version: $VERSION$
 echo -n $$ > $PIDFILE$
-TMP_CONFIG_FILE=`mktemp`
-cat $AGENT_CONFIG_FILE$ > $TMP_CONFIG_FILE
-if [ -n "$(ls -A $AGENT_ETC_CONFD_DIR$)" ]; then
-    cat $AGENT_ETC_CONFD_DIR$/* >> $TMP_CONFIG_FILE
-fi
-/usr/bin/env -i AWS_CONFIG_FILE=$AWS_CONFIG_FILE$ HOME=$HOME$ $NICE_PATH$ -n 4 $CLIPATH$ logs push --config-file $TMP_CONFIG_FILE >> /var/log/awslogs.log 2>&1
+[ -f $AWS_PROXY_CONFIG_FILE$ ] && . $AWS_PROXY_CONFIG_FILE$
+/usr/bin/env -i HTTPS_PROXY=$HTTPS_PROXY HTTP_PROXY=$HTTP_PROXY NO_PROXY=$NO_PROXY AWS_CONFIG_FILE=$AWS_CONFIG_FILE$ HOME=$HOME$ $NICE_PATH$ -n 4 $CLIPATH$ logs push --config-file $AGENT_CONFIG_FILE$ --additional-configs-dir $AGENT_ADDITIONAL_CONFIGS_DIR$ >> /var/log/awslogs.log 2>&1
 """
 
 NANNY_SCRIPT = """#!/bin/sh
@@ -94,7 +88,14 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 30 * * * * root logrotate -s /var/log/logstatus /etc/logrotate.d/awslogs
 """
 
-AWSLOGS_VERSION = "1.3.6"
+PROXY_CONFIG = """
+# Version: {VERSION}
+# Refer to http://docs.aws.amazon.com/cli/latest/userguide/cli-http-proxy.html for details.
+HTTP_PROXY={http_proxy}
+HTTPS_PROXY={https_proxy}
+NO_PROXY={no_proxy}"""
+
+AWSLOGS_VERSION = "1.3.9"
 HOME = os.path.expandvars("$HOME")
 AWSLOGS_HOME = "/var/awslogs"
 AWSLOGS_BIN = AWSLOGS_HOME + "/bin"
@@ -102,10 +103,11 @@ AWSCLI_CMD = AWSLOGS_BIN + "/aws"
 VIRTUALENV_ACTIVATE_CMD = AWSLOGS_BIN + "/activate"
 AGENT_STATE_DIR = AWSLOGS_HOME + "/state"
 AGENT_ETC_DIR = AWSLOGS_HOME + "/etc"
-AGENT_ETC_CONFD_DIR = AWSLOGS_HOME + "/etc/conf.d"
 AGENT_SETUP_LOG_FILE = "/var/log/awslogs-agent-setup.log"
 AGENT_CONFIG_FILE = AGENT_ETC_DIR + "/awslogs.conf"
+AGENT_ADDITIONAL_CONFIGS_DIR = AGENT_ETC_DIR + "/config"
 AWS_CONFIG_FILE = AGENT_ETC_DIR + "/aws.conf"
+AWS_PROXY_CONFIG_FILE = AGENT_ETC_DIR + "/proxy.conf"
 AGENT_LAUNCHER = AWSLOGS_BIN + "/awslogs-agent-launcher.sh"
 AGENT_NANNY_PATH = AWSLOGS_BIN + "/awslogs-nanny.sh"
 AGENT_LOCK_FILE = AGENT_STATE_DIR + "/awslogs.lock"
@@ -285,6 +287,7 @@ DEFAULT_CONFIG = """
 # ------------------------------------------
 # CONFIGURATION DETAILS
 # ------------------------------------------
+# Refer to http://docs.aws.amazon.com/AmazonCloudWatch/latest/DeveloperGuide/AgentReference.html for details.
 
 [general]
 # Path to the CloudWatch Logs agent's state file. The agent uses this file to maintain
@@ -385,13 +388,14 @@ UNSUPPORTED_REGION = 5
 MISSING_DEPENDENCY = 6
 
 class CloudWatchLogsAgentSetup:
-    Rhel, Ubuntu, AmazonLinux, CentOS, Raspbian = range(5)
+    Rhel, Ubuntu, AmazonLinux, CentOS, Raspbian, Debian = range(6)
 
     installer_name_map = {Rhel: "yum",
                           Ubuntu: "apt-get",
                           AmazonLinux: "yum",
                           CentOS: "yum",
-                          Raspbian: "apt-get"}
+                          Raspbian: "apt-get",
+                          Debian: "apt-get"}
 
     def __init__(self, log_file, options):
         self.log_file = log_file
@@ -402,18 +406,22 @@ class CloudWatchLogsAgentSetup:
         self.os_flavor = self.get_distro_info()
         self.plugin_url = options.plugin_url
         self.python = options.python
+        self.http_proxy = options.http_proxy if options.http_proxy else ""
+        self.https_proxy = options.https_proxy if options.https_proxy else ""
+        self.no_proxy = options.no_proxy if options.no_proxy else ""
         self.generated_filepaths = []
 
     def write_launcher_file(self):
         file_path = AGENT_LAUNCHER
-        nicepath = subprocess.Popen(['which', 'nice'], stdout=subprocess.PIPE).communicate()[0].rstrip()
+        nicepath = subprocess.Popen(['which', 'nice'], stdout=subprocess.PIPE, universal_newlines=True).communicate()[0].rstrip()
         contents = LAUNCHER_SCRIPT.replace("$REGION$", self.region)
         contents = contents.replace("$HOME$", HOME)
         contents = contents.replace("$NICE_PATH$", nicepath)
         contents = contents.replace("$CLIPATH$", AWSCLI_CMD)
+        contents = contents.replace("$AWS_PROXY_CONFIG_FILE$", AWS_PROXY_CONFIG_FILE)
         contents = contents.replace("$PIDFILE$", AGENT_PID_FILE)
         contents = contents.replace("$AGENT_CONFIG_FILE$", AGENT_CONFIG_FILE)
-        contents = contents.replace("$AGENT_ETC_CONFD_DIR$", AGENT_ETC_CONFD_DIR)
+        contents = contents.replace("$AGENT_ADDITIONAL_CONFIGS_DIR$", AGENT_ADDITIONAL_CONFIGS_DIR)
         contents = contents.replace("$AWS_CONFIG_FILE$", AWS_CONFIG_FILE)
         contents = contents.replace("$VERSION$", AWSLOGS_VERSION)
         with open(file_path, "w") as file:
@@ -445,7 +453,7 @@ class CloudWatchLogsAgentSetup:
         else:
             fail("Failed to determine linux distribution. Exiting.", PLATFORM_NOT_SUPPORTED)
 
-        # Support Amazon Linux, Ubuntu, CentOS, and RHEL.
+        # Support Amazon Linux, Ubuntu, CentOS, Debian, Raspbian and RHEL.
         with open(issue_file_path, "r") as issue_file:
             line = issue_file.readline()
             if line.startswith("Amazon Linux AMI"):
@@ -458,6 +466,8 @@ class CloudWatchLogsAgentSetup:
                 return self.CentOS
             elif line.startswith("Raspbian"):
                 return self.Raspbian
+            elif line.startswith("Debian"):
+                return self.Debian
             else:
                 fail("Failed to determine linux distribution. Exiting.", PLATFORM_NOT_SUPPORTED)
 
@@ -503,13 +513,12 @@ class CloudWatchLogsAgentSetup:
                          'pip<7.0.0'],
                          stderr=self.log_file,
                          stdout=self.log_file)
-        subprocess.call([AWSLOGS_BIN + '/pip',
-                         'install',
-                         '--upgrade',
-                         '--extra-index-url=' + self.plugin_url,
-                         'awscli-cwlogs==1.3.1'],
-                         stderr=self.log_file,
-                         stdout=self.log_file)
+        plugin_install_cmd = [AWSLOGS_BIN + '/pip', 'install', '--upgrade', 'awscli-cwlogs==1.4.0']
+        if self.plugin_url:
+            plugin_install_cmd.append('--extra-index-url=' + self.plugin_url)
+        subprocess.call(plugin_install_cmd,
+                        stderr=self.log_file,
+                        stdout=self.log_file)
         # Setup awslogs plugin
         subprocess.call([AWSCLI_CMD, 'configure', 'set', 'plugins.cwlogs', 'cwlogs'], env=DEFAULT_ENV)
         # Setup the default region for the CLI
@@ -568,9 +577,12 @@ class CloudWatchLogsAgentSetup:
         self.log_generated_file("/etc/rc5.d/S99awslogs")
         self.log_generated_file("/etc/rc6.d/S99awslogs")
 
+        if self.os_flavor == self.Debian:
+            subprocess.call(['/usr/sbin/update-rc.d', 'awslogs', 'defaults'], env=DEFAULT_ENV, stderr=self.log_file, stdout=self.log_file)
+
     def setup_agent_as_daemon(self):
         # We use init.d for AmazonLinux and Upstart for Ubuntu.
-        if self.os_flavor == self.AmazonLinux or self.os_flavor == self.Ubuntu or self.os_flavor == self.Rhel or self.os_flavor == self.CentOS or self.os_flavor == self.Raspbian:
+        if self.os_flavor == self.AmazonLinux or self.os_flavor == self.Ubuntu or self.os_flavor == self.Rhel or self.os_flavor == self.CentOS or self.os_flavor == self.Raspbian or self.os_flavor == self.Debian:
             self.setup_initd()
         else:
             fail("Unsupported platform.", PLATFORM_NOT_SUPPORTED)
@@ -583,9 +595,13 @@ class CloudWatchLogsAgentSetup:
             else:
                 self.install("python-pip")
 
+        # If executable still doesn't exist, we have a problem
+        if not executable_exists("pip"):
+            fail("Could not install pip. Please try again or see " + AGENT_SETUP_LOG_FILE + " for more details")
+
     def setup_agent_log_file_rotation(self):
         config = AGENT_LOG_ROTATE_CONFIG
-        if self.os_flavor == self.Ubuntu:
+        if self.os_flavor == self.Ubuntu or self.os_flavor == self.Debian:
             config = config.replace('$SU_FOR_UBUNTU$','su root root')
         else:
             config = config.replace('$SU_FOR_UBUNTU$','')
@@ -609,10 +625,10 @@ class CloudWatchLogsAgentSetup:
 
     def write_nanny_script(self):
         file_path = AGENT_NANNY_PATH
-        ps_path = subprocess.Popen(['which', 'ps'], stdout=subprocess.PIPE).communicate()[0].rstrip()
-        grep_path = subprocess.Popen(['which', 'grep'], stdout=subprocess.PIPE).communicate()[0].rstrip()
-        cat_path = subprocess.Popen(['which', 'cat'], stdout=subprocess.PIPE).communicate()[0].rstrip()
-        service_path = subprocess.Popen(['which', 'service'], stdout=subprocess.PIPE).communicate()[0].rstrip()
+        ps_path = subprocess.Popen(['which', 'ps'], stdout=subprocess.PIPE, universal_newlines=True).communicate()[0].rstrip()
+        grep_path = subprocess.Popen(['which', 'grep'], stdout=subprocess.PIPE, universal_newlines=True).communicate()[0].rstrip()
+        cat_path = subprocess.Popen(['which', 'cat'], stdout=subprocess.PIPE, universal_newlines=True).communicate()[0].rstrip()
+        service_path = subprocess.Popen(['which', 'service'], stdout=subprocess.PIPE, universal_newlines=True).communicate()[0].rstrip()
         contents = NANNY_SCRIPT.replace("$PIDFILE$", AGENT_PID_FILE)
         contents = contents.replace("$LOCKFILE$", AGENT_LOCK_FILE)
         contents = contents.replace("$AGENT_LAUNCHER$", AGENT_LAUNCHER)
@@ -662,11 +678,15 @@ class CloudWatchLogsAgentSetup:
             os.mkdir(AGENT_STATE_DIR)
         if not os.path.exists(AGENT_ETC_DIR):
             os.mkdir(AGENT_ETC_DIR)
-        if not os.path.exists(AGENT_ETC_CONFD_DIR):
-            os.mkdir(AGENT_ETC_CONFD_DIR)
+        if not os.path.exists(AGENT_ADDITIONAL_CONFIGS_DIR):
+            os.mkdir(AGENT_ADDITIONAL_CONFIGS_DIR)
 
-        if self.os_flavor == self.Ubuntu:
+        if self.os_flavor == self.Ubuntu or self.os_flavor == self.Debian:
             subprocess.call(['apt-get', 'update'], stdout=self.log_file, stderr=self.log_file)
+
+        with open(AWS_PROXY_CONFIG_FILE, "w") as config:
+            config.write(PROXY_CONFIG.format(http_proxy=self.http_proxy, https_proxy=self.https_proxy, no_proxy=self.no_proxy, VERSION=AWSLOGS_VERSION))
+        self.log_generated_file(AWS_PROXY_CONFIG_FILE)
 
         if not self.only_generate_config:
             message("\nStep 1 of 5: Installing pip ...")
@@ -706,7 +726,7 @@ class CloudWatchLogsAgentSetup:
 
         if self.os_flavor == self.AmazonLinux or self.os_flavor == self.Rhel or self.os_flavor == self.CentOS:
             log_file_path = '/var/log/messages'
-        elif self.os_flavor == self.Ubuntu or self.os_flavor == self.Raspbian:
+        elif self.os_flavor == self.Ubuntu or self.os_flavor == self.Raspbian or self.os_flavor == self.Debian:
             log_file_path = '/var/log/syslog'
 
         return {'file_path': log_file_path,
@@ -827,11 +847,12 @@ def parse_args():
                       help="Local path, S3 path or http(s) based URL of the CloudWatch Logs agent's configuration file.")
 
     # Optional parameter for the custom CLI url. This is only used for testing purposes.
-    parser.add_option("-u", "--plugin-url", dest="plugin_url", default='http://aws-cloudwatch.s3-website-us-east-1.amazonaws.com/',
-                      help="URL of CloudWatch Logs plugin.")
+    parser.add_option("-u", "--plugin-url", dest="plugin_url", help="URL of CloudWatch Logs plugin.")
     parser.add_option("-p", "--python", dest="python",
                       help="The Python interpreter to use. The default is the interpreter that virtualenv was installed with (/usr/bin/python)")
-
+    parser.add_option("--http-proxy", dest="http_proxy", help="The http proxy that's used to communicate with CloudWatch Logs service.")
+    parser.add_option("--https-proxy", dest="https_proxy", help="The https proxy that's used to communicate with CloudWatch Logs service.")
+    parser.add_option("--no-proxy", dest="no_proxy", help="A comma-separated list of domain extensions the proxy should not be used for.")
     options, args = parser.parse_args()
     return options
 
@@ -1099,7 +1120,7 @@ def main():
         fail("This script doesn't support Microsoft Windows", PLATFORM_NOT_SUPPORTED)
 
     python_version = sys.version_info
-    if python_version < (2,6) or python_version > (3,3):
+    if python_version < (2,6) or python_version >= (3,4):
         fail("This script only supports python version 2.6 - 3.3", PLATFORM_NOT_SUPPORTED)
 
     if options.only_generate_config and options.non_interactive:
